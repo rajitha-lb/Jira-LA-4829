@@ -1,60 +1,55 @@
+""
+Module to consume files/email from a Kafka topic for the datasource.
+
+Downloads the contents of the file/email and sends them to tika service for processing.
 """
-Module to consume files from Kafka topic for the datasource.
-from multiple document formats and additionally calls ml-service for files which it cannot extract data from
-(e.g. pdf and image files). The response received from tika service is then written to MongoDB by this consumer.
-"""
-import copy
+import base64
+import csv
+import hashlib
 import json
 import os
 import signal
 import sys
-import tempfile
-from collections import defaultdict
-from datetime import datetime
-from pathlib import Path
-from typing import Any, DefaultDict, Dict, Iterable, List, NamedTuple, Optional, Tuple, Union
-import pytz
-import rclone
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Set
 import requests
-from bson import ObjectId, json_util
+from bson import Int64, ObjectId, json_util
+from document_utils.document import should_create_document
+from googleapiclient.errors import HttpError
 from kafka.consumer.fetcher import ConsumerRecord
 from kafka_utils.consts import DATASOURCE_STATS_KAFKA_TOPIC_NAME
 from kafka_utils.consumer import Consumer
 from kafka_utils.producer import Producer
-from lb_common.service_requests import send_file_to_tika
-from lb_common.utils import process_log_file_request
+from lb_common.service_requests import send_message_to_presidio
+from lb_common.utils import extract_domain_from_email
 from logger_utils import logger
-from mongo_utils.consts import (ARCHIVED_DOCUMENT, DATASOURCE, DOCUMENT, DOCUMENT_ANNOTATION_TYPE_FILTER,
-                                DUPLICATE_RECORDS, GOOGLE_DRIVE_DATASOURCE, MONGODB_DATABASE_NAME, OBJ_TYPE_DOCUMENT,
-                                PII_RECORD, AttachmentDownloadFailedSkipReason, TikaProcessingFailedSkipReason,
+from mongo_utils import SINGLETON_MONGO_CLIENT
+from mongo_utils.consts import (DATASOURCE, DOCUMENT, GMAIL_DATASOURCE, MAIL, OBJ_TYPE_DOCUMENT, OBJ_TYPE_MESSAGE,
+                                TRANSLATE_FILE_TYPE, VIOLATION, PresidioProcessingFailedSkipReason,
+                                PresidioRequestFailedSkipReason, TikaProcessingFailedSkipReason,
                                 TikaRequestFailedSkipReason)
-from mongo_utils.mongo import SINGLETON_CLIENT as SINGLETON_MONGO_CLIENT
+from mongo_utils.datasource_user_summary import update_mail_size_user_summary
+from mongo_utils.identifier_manager import IdentifierManager
 from prometheus_client import CollectorRegistry, Counter, push_to_gateway
 from prometheus_utils.constants import PROMETHEUS_PUSH_GATEWAY_URL
-from pymongo import InsertOne, UpdateOne
+from pymongo import UpdateOne
 from requests.adapters import HTTPAdapter, Retry
-from requests.sessions import Session as RequestsSession
-from retry import retry
 from tika_utils.consts import VALID_TYPES
 from tika_utils.v1.response_processor import TikaResponseProcessor
-
-# Constants dealing with the location and name of the rclone config file.
 from vault_utils.vault_client import get_configuration
-
 from common.config import Config
-from common.consts import (DELEGATED_CREDENTIAL_ENV, DOMAIN_ENV, KAFKA_BOOTSTRAP_SERVERS, KAFKA_CONSUMER_OFFSET,
-                           KAFKA_MAX_POLL_INTERVAL_MS, KAFKA_MAX_POLL_RECORDS, KAFKA_POLL_TIMEOUT, LOG_FILE_EXTENSIONS,
-                           LOG_FILE_MAX_ALLOWED_CHARS, ML_SERVICES_RETRY_ATTEMPTS, ML_SERVICES_RETRY_DELAY_SECONDS,
-                           PERSON_ACCOUNT_TYPE, PROCESSED_BYTES_LABEL_NAMES)
-from common.gsuite_utils import (CHECKSUM_TYPE, DRIVE_TYPE_USER, fetch_updated_cred, handle_permissions,
-                                 retrieve_permissions, service_account_login_drive_with_subject)
-from common.rclone_utils import (RCLONE_CONF_DRIVE_NAME, create_rclone_config, get_personal_google_drive_rclone_config,
-                                 process_rclone_env_variables)
+from common.consts import (DATASOURCE_ID, DELEGATED_CREDENTIAL_ENV, DOMAIN_ENV, FILE_MAX_SIZE_BYTES_VAL,
+                           KAFKA_BOOTSTRAP_SERVERS_VAL, KAFKA_CONSUMER_OFFSET_VAL, KAFKA_MAX_POLL_INTERVAL_MS_VAL,
+                           KAFKA_MAX_POLL_RECORDS_VAL, KAFKA_POLL_TIMEOUT, PROCESSED_BYTES_LABEL_NAMES)
+from common.group_manager import SINGLETON_GROUP_MANAGER
+from common.gsuite_utils import (check_for_mail_risk, contains_calendar_attachment, get_domain, get_name_and_email,
+                                 service_account_login_gmail, update_mail_count_external_members,
+                                 update_mail_count_group_summary, update_mail_count_user_summary)
+from common.rclone_utils import process_rclone_env_variables
+from src.common.consts import RecipientInfo
+from src.common.gsuite_utils import contains_attachment
 
-MODULE_DIR = Path(__file__).resolve().parent
-CONFIG_DIR = (MODULE_DIR / "../.." / "config").resolve()
-
-
+NOT_FOUND = 404
 SIGTERM_SHUTDOWN = False
 """Whether the service has received the shutdown signal from SIGTERM."""
 
@@ -67,505 +62,67 @@ def sigterm_handler(signal: Any, frame: Any):
     SIGTERM_SHUTDOWN = True
 
 
-def create_config(datasource_id: ObjectId) -> Config:
-    """
-    Process GSuite and Kafka environment variables and creates a config object.
-    :param datasource_id: Id of the datasource instance in MongoDB.
-    :return: Config object.
-    """
-    datasource = SINGLETON_MONGO_CLIENT[MONGODB_DATABASE_NAME][DATASOURCE].find_one({"_id": datasource_id}, {"_id": 0})
-    datasource["configuration"] = get_configuration()
-    datasource_config = datasource["configuration"]
-    service_account_file = process_rclone_env_variables(datasource_id)
-    delegated_credential = os.getenv(DELEGATED_CREDENTIAL_ENV)
-    domain = os.getenv(DOMAIN_ENV)
-
-    # Kafka config.
-    kafka_bootstrap_servers = os.getenv(KAFKA_BOOTSTRAP_SERVERS)
-    kafka_consumer_offset = os.getenv(KAFKA_CONSUMER_OFFSET)
-    kafka_max_poll_records = int(os.getenv(KAFKA_MAX_POLL_RECORDS, 2))
-    kafka_max_poll_interval_ms = int(os.getenv(KAFKA_MAX_POLL_INTERVAL_MS, 420000))
-
-    tika_request_timeout = int(os.getenv("TIKA_REQUEST_TIMEOUT", 900))
-    # As Tika processing takes quite some time, we need to ensure that we fetch a limited number of messages in each
-    # poll call of the consumer so that consumer polling interval is within threshold and that the consumer stays
-    # alive.
-    if (kafka_max_poll_interval_ms - 100) < (kafka_max_poll_records * (tika_request_timeout * 1000)):
-        raise Exception("Kafka consumer polling parameter values not compatible with max tika response time")
-    config = Config(datasource_id, service_account_file, delegated_credential, domain, kafka_bootstrap_servers,
-                    kafka_consumer_offset=kafka_consumer_offset, kafka_max_poll_records=kafka_max_poll_records,
-                    kafka_max_poll_interval_ms=kafka_max_poll_interval_ms,
-                    account_type=datasource_config["accountType"])
-    return config
-
-
-class Document(NamedTuple):
-    """
-    Represents a document record being processed by the consumer.
-
-    document: MongoDB document record.
-    skip_document: Whether the consumer should skip further processing of the document based on initial checks.
-    is_new_document: Whether the document being processed is identified by the system for the first time or is an
-    updated version of an existing document record in the system.
-    """
-    document: Dict[str, Any]
-    skip_document: bool
-    is_new_document: bool
-
-
-class GoogleDriveConsumer:
-    def __init__(self, datasource_id: ObjectId):
+class GoogleEmailConsumer:
+    def __init__(self, datasource: Dict[str, Any], config: Config):
         """
-        Create a Google Drive consumer object responsible for consuming message from the datasource topic and processing
-        the file by downloading it and sending to the file handler service and writing the results to MongoDB.
-        :param datasource_id: MongoDB ObjectId of the datasource to be used as Kafka topic to consume files from.
+        Creates a Google email consumer object responsible for consuming message from the datasource topic and
+        processing the file by downloading it and sending to the file handler service and writing the results to
+        MongoDB.
+        :param datasource: Datasource details.
+        :param config: Gmail account config.
         """
-        self._config = create_config(datasource_id)
-        self._stats_aggregator_producer = Producer(self._config.kafka_bootstrap_servers)
-        self._db = SINGLETON_MONGO_CLIENT[MONGODB_DATABASE_NAME]
-        self._datasource_id = datasource_id
-        datasource_record = self._db[DATASOURCE].find_one({"_id": datasource_id},
-                                                          {"_id": 0, "name": 1, "location": 1, "type": 1})
-        if not datasource_record:
-            raise Exception(f"Datasource {datasource_id} does not exist")
-        self._datasource_name = datasource_record["name"]
-        self._datasource_location = datasource_record["location"]
-        self._datasource_type = datasource_record["type"]
+        self._config = config
+        self._mongo_client = SINGLETON_MONGO_CLIENT
+        self._datasource_id = datasource["_id"]
+        self._datasource_name = datasource["name"]
+        self._datasource_location = datasource["location"]
+        self._datasource_type = datasource["type"]
 
-        self._topic_name = os.getenv("KAFKA_TOPIC_NAME")
-        if not self._topic_name:
-            raise Exception(f"Topic name not set for consumer deployment of datasource {datasource_id}")
-        self._consumer = Consumer(self._config.kafka_bootstrap_servers,
-                                  self._config.kafka_consumer_offset,
-                                  self._config.kafka_max_poll_records,
-                                  self._config.kafka_max_poll_interval_ms,
-                                  self._topic_name).consumer
-        self._drive = None
-        self._rclone_instance = None
+        self._kafka_topic_name = os.getenv("KAFKA_TOPIC_NAME")
+        kafka_consumer = Consumer(KAFKA_BOOTSTRAP_SERVERS_VAL,
+                                  KAFKA_CONSUMER_OFFSET_VAL,
+                                  KAFKA_MAX_POLL_RECORDS_VAL,
+                                  KAFKA_MAX_POLL_INTERVAL_MS_VAL,
+                                  self._kafka_topic_name)
+        self._consumer = kafka_consumer.consumer
+
+        # Tika server request client config params.
+        self._tika_url = os.getenv("TIKA_URL")
+        self._tika_timeout = int(os.getenv("TIKA_REQUEST_TIMEOUT", 900))
         self._tika_response_processor = TikaResponseProcessor(self._datasource_id, self._datasource_name,
-                                                              self._datasource_location, GOOGLE_DRIVE_DATASOURCE)
-        self._raise_request_failure_exception = True if os.getenv(
-            "RAISE_REQUEST_FAILURE_EXCEPTION", "False").lower() == "true" else False
+                                                              self._datasource_location, GMAIL_DATASOURCE)
+        self._raise_request_failure_exception = os.getenv(
+            "RAISE_TIKA_FAILURE_EXCEPTION", "False").lower() == "true"
+
+        # Presidio server request client config params.
+        self._presidio_url = os.getenv("PRESIDIO_URL")
+        self._presidio_timeout = int(os.getenv("PRESIDIO_REQUEST_TIMEOUT", 900))
+        self._raise_presidio_request_failure_exception = os.getenv(
+            "RAISE_PRESIDIO_FAILURE_EXCEPTION", "False").lower() == "true"
+
+        self._session = requests.Session()
+        retries = Retry(total=2,
+                        backoff_factor=0.1,
+                        status_forcelist=[500, 502, 503, 504])
+        self._session.mount(self._tika_url, HTTPAdapter(max_retries=retries))
+        self._documents_to_be_marked_risky: List[UpdateOne] = []
+        # Initialize singleton group manager in consumer to avoid unnecessary thread creation for other components.
+        SINGLETON_GROUP_MANAGER.initialize(SINGLETON_MONGO_CLIENT)
+
+        self._stats_aggregator_producer = Producer(self._config.kafka_bootstrap_servers)
 
         self._prometheus_registry = CollectorRegistry()
-        self._processed_bytes = Counter("processed_bytes", "Google Drive Total Bytes Processed",
+        self._processed_bytes = Counter("processed_bytes", "Google Mail Total Bytes Processed",
                                         labelnames=PROCESSED_BYTES_LABEL_NAMES,
                                         registry=self._prometheus_registry)
-
-        # A map maintained for each message that contains keys as collection names and values are a
-        # list of MongoDB operations to be performed on the collection. The operations in these map are executed in a
-        # transaction so that consistency is ensured.
-        self._message_db_ops: DefaultDict[str, List[Union[InsertOne, UpdateOne]]] = defaultdict(list)
-        # Current processing document details and corresponding pii records.
-        self._current_document: Optional[Dict[str, Any]] = None
-        self._current_pii_records: Optional[List[Dict[str, Any]]] = None
-        # Previous document details and and corresponding pii records, in case of document update.
-        self._prev_document: Optional[Dict[str, Any]] = None
-        self._prev_pii_records: Optional[List[Dict[str, Any]]] = None
-
-    def _create_rclone_instance(self):
-        """Creates rclone instance. Rclone instance is used to copy files from GDrive account."""
-        rclone_config = create_rclone_config(self._config)
-        self._rclone_instance = rclone.with_config(rclone_config)
-
-    def download_file(self, file_path: str, target_dir: Union[str, bytes], drive_id: str,
-                      shared_drive_user_email: Optional[str] = None, trashed: bool = False,
-                      parent_folder_shared_with_user: bool = False) -> Tuple[bool, int]:
-        """Downloads the file to the target directory.
-        It is possible for the file to not be present because of the race condition where the file gets deleted after
-        it is accessed so it needs to handle that case as well.
-        :param file_path: File path in the source Google Drive.
-        :param target_dir: Local directory where the file should be downloaded to.
-        :param drive_id: In the case of an individual drive, this is the email Id of the user on whose behalf the drive
-        is accessed to download the file. Otherwise, in the case of shared drive, this is the drive Id given by
-        Google API which is to be specified as the root folder to look in for the document to be downloaded and the
-        user email is passed in a separate param `shared_drive_user_email` on whose behalf the drive is accessed to
-        download the file.
-        :param shared_drive_user_email: Only set and used in case of a shared drive to impersonate a user who has
-        access to the shared drive.
-        :param trashed: Whether document is in the trash bin.
-        :param parent_folder_shared_with_user: Whether the file owned by the user belongs to a parent folder which is
-            not owned by the user but instead is shared with the user.
-        :return: Returns whether the file was downloaded successfully and the size of the file measured in bytes.
-        """
-        if self._config.account_type == PERSON_ACCOUNT_TYPE:
-            # For personal Google Drive, we need to refresh the access token and update rclone config.
-            cred = fetch_updated_cred(self._config.service_account_file)
-            rclone_config = get_personal_google_drive_rclone_config(cred)
-            self._rclone_instance = rclone.with_config(rclone_config)
-
-        user = drive_id
-        flags = [f"--drive-impersonate={drive_id}"]
-        if parent_folder_shared_with_user:
-            flags.append("--drive-shared-with-me")
-        if shared_drive_user_email:
-            user = shared_drive_user_email
-            flags = [f"--drive-impersonate={shared_drive_user_email}", f"--drive-root-folder-id={drive_id}"]
-        if trashed:
-            flags.append("--drive-trashed-only")
-        res = self._rclone_instance.copy(source=f"{RCLONE_CONF_DRIVE_NAME}:/{file_path}", dest=target_dir,
-                                         flags=flags)
-        if res["code"] != 0:
-            error = res["error"].decode("utf-8")
-            if "directory not found" in error:
-                logger.info(f"Skipping {file_path} for {user} as it's not present anymore")
-                return False, -1
-            raise Exception(f"Unable to copy file {file_path} for user {user}: {error}")
-        file_name = Path(file_path).name
-        downloaded_file_path = target_dir / Path(file_name)
-        try:
-            file_size = os.stat(downloaded_file_path).st_size
-        except Exception as error:
-            logger.error(f"Exception in {downloaded_file_path} while getting file size: {error}")
-            return False, -1
-        logger.debug(f"Downloaded {file_path} having size {file_size} from drive {drive_id} to {target_dir}")
-        return True, file_size
-
-    def _check_duplicate_exists(self, document_id: ObjectId, checksum: str, checksum_type: str) -> bool:
-        """
-        Checks whether a duplicate document exists having the same checksum as the given document.
-        :param document_id: Id of the document being scanned.
-        :param checksum: Checksum string.
-        :param checksum_type: Checksum hash method.
-        :return: Whether a duplicate document exists.
-        """
-        # TODO: Handle concurrency issues.
-        duplicate_document = self._db[DOCUMENT].find_one({"checksum": checksum, "checksumType": checksum_type,
-                                                          "_id": {"$ne": document_id}}, {"_id": 1})
-        return bool(duplicate_document)
-
-    def _record_duplicates(self, document_id: ObjectId, checksum: str, checksum_type: str):
-        """
-        Records the document Id in the duplicate records collection if it's a duplicate.
-        :param document_id: Id of the document being scanned.
-        :param checksum: Checksum string.
-        :param checksum_type: Checksum hash calculation method.
-        """
-        duplicate_exists = self._check_duplicate_exists(document_id, checksum, checksum_type)
-        if not duplicate_exists:
-            return
-
-        self._message_db_ops[DUPLICATE_RECORDS].append(UpdateOne({"checksum": checksum, "checksumType": checksum_type},
-                                                                 {"$addToSet": {"documentIds": document_id}},
-                                                                 upsert=True))
-
-    def _handle_existing_document_metadata(self, old_document: Dict[str, Any],
-                                           message: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
-        """Update database records for existing document. Based on checking file content for changes, returns whether
-        the document should be further processed or skipped.
-        :returns: A tuple consisting of the updated document record and a boolean indicating whether to send the
-                  document to the downstream AI/ML service for further processing.
-        """
-        additional_metadata = self._build_additional_metadata(message)
-        file_checksum = message.get("md5Checksum")
-        file_size = int(message.get("size", -1))
-        document_id = old_document["_id"]
-        update_dict = {"lastModifiedTime": message["fileModDt"], "additionalMetadata": additional_metadata,
-                       "trashed": message["trashed"], "skipped": message["skipped"],
-                       "version": old_document["version"] + 1}
-        if message["skipReason"]:
-            update_dict["skipReason"] = message["skipReason"]
-
-        if file_checksum == old_document["checksum"]:
-            # This method is called after checking that the modified time of the current version of the file is
-            # different than the one in the database record for the file. Although, the checksum has not changed,
-            # we want to update the modified time along with any change in additional metadata fields and trash status
-            # of the file.
-            logger.info(f"Updating metadata for document {document_id} in the db")
-            self._message_db_ops[DOCUMENT].append(UpdateOne({"_id": document_id}, {"$set": update_dict}))
-            old_document.update(update_dict)
-            return old_document, bool(old_document.get("processed"))
-
-        file_path = message["filePath"]
-        update_dict["checksum"] = file_checksum if file_checksum else ""
-        update_dict["processed"] = False
-        update_dict["scanned"] = True
-        if file_size > 0:
-            update_dict["size"] = file_size
-        self._message_db_ops[DOCUMENT].append(UpdateOne({"_id": document_id}, {"$set": update_dict}))
-        logger.info(f"Updated MongoDB document {document_id} and file {file_path}")
-
-        if file_checksum:
-            self._record_duplicates(document_id, file_checksum, CHECKSUM_TYPE)
-
-        old_document.update(update_dict)
-        return old_document, False
-
-    def _handle_new_document_metadata(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        """Creates a new record in the MongoDB document collection, checks and records if the document is a duplicate
-        and updates summary collections."""
-        additional_metadata = self._build_additional_metadata(message)
-        file_checksum = message.get("md5Checksum")
-        mongo_document = {"name": message["filePath"],
-                          "type": message["fileExtension"] if message["fileExtension"] in VALID_TYPES else "other",
-                          "objectType": OBJ_TYPE_DOCUMENT,
-                          "sharedBy": {"name": message["driveName"],
-                                       "email": message["driveId"]},
-                          "datasourceId": self._datasource_id,
-                          "lastModifiedTime": message["fileModDt"],
-                          "checksum": file_checksum if file_checksum else "",
-                          "additionalMetadata": additional_metadata,
-                          "checksumType": CHECKSUM_TYPE,
-                          "processed": False,
-                          "scanned": True,
-                          "version": 1,
-                          "trashed": message["trashed"],
-                          "skipped": message["skipped"]}
-        if message["skipReason"]:
-            mongo_document["skipReason"] = message["skipReason"]
-        file_size = int(message.get("size", -1))
-        if file_size > 0:
-            mongo_document["size"] = file_size
-        else:
-            file_data = self._get_file_data(message)
-            mongo_document["size"] = file_data["fileSize"] if file_data else 0
-
-        # This is the only operation which is happening outside the transaction. The reason is that we need the
-        # document ID of the newly inserted document for further processing and the operations happening in the
-        # transactions are bulk writes which give no option to extract ID for an individual record. In case of a
-        # partial failure, meaning when we insert this document and subsequent operations fail, it should not be an
-        # issue because consumer would try to reprocess the same message from the topic as the offset would not have
-        # been committed and the document would be processed as an existing record and updates would only
-        # happen on the metadata in case of a mismatch where idempotency is ensured.
-        result = self._db[DOCUMENT].insert_one(mongo_document)
-
-        document_id = result.inserted_id
-        mongo_document["_id"] = document_id
-        logger.info(f"Inserted MongoDB document {document_id} and file {mongo_document['name']}")
-
-        if file_checksum:
-            self._record_duplicates(document_id, file_checksum, CHECKSUM_TYPE)
-        return mongo_document
-
-    def _get_file_sharing_details(self, file_id: str, drive_id: str, drive_type: str) -> Dict[str, Any]:
-        """Retrieves information about which all users, groups and domains that the file is shared with."""
-        permissions = retrieve_permissions(self._drive, file_id, drive_type)
-        file_sharing_details = {}
-        if permissions:
-            if drive_type == DRIVE_TYPE_USER:
-                file_sharing_details = handle_permissions(permissions, self._config.domain, drive_id)
-            else:
-                file_sharing_details = handle_permissions(permissions, self._config.domain)
-        return file_sharing_details
-
-    def _build_additional_metadata(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        """Builds and returns a metadata dictionary which also includes file sharing details to be used in
-        creating/updating record in MongoDB document collection."""
-        file_id = message["id"]
-        drive_type = message["driveType"]
-        drive_id = message["driveId"]
-        web_view_link = message["webViewLink"]
-        drive_name = message["driveName"]
-
-        # TODO (Keshav.G): Google Drive API returns the list of the parents. Check when this can be list and handle the
-        #  case.
-
-        additional_metadata = {"vendorItemId": file_id, "driveType": drive_type, "driveId": drive_id,
-                               "driveName": drive_name, "objectLink": web_view_link,
-                               "parentFolderSharedWithUser": bool(message.get("parentFolderSharedWithUser"))}
-        if message.get("parents"):
-            additional_metadata["folderId"] = message["parents"][0]
-
-        if message.get("sharedDriveUserEmail"):
-            additional_metadata["sharedDriveUserEmail"] = message["sharedDriveUserEmail"]
-            self._drive = service_account_login_drive_with_subject(self._config, message["sharedDriveUserEmail"])
-        else:
-            self._drive = service_account_login_drive_with_subject(self._config, drive_id)
-        file_sharing_details = self._get_file_sharing_details(file_id, drive_id, drive_type)
-        additional_metadata.update(file_sharing_details)
-        return additional_metadata
-
-    def _should_skip_document(self, message: Dict[str, Any]) -> Document:
-        """
-        Checks if the document should be skipped for processing.
-        Existing documents having the same modified time and trash status need no processing at all. Also, for existing
-        documents, when modified time or trash status has changed, but there is no change in checksum, then only
-        metadata is updated and further processing is skipped. New documents need to be processed as there exist no
-        records for them in the system.
-        """
-        skip_document = False
-        # Whether to update the skipped counter statistics. If a document has already been marked as skipped, we
-        # should not be updating any of the skipped counters.
-        # TODO: Since we create the document outside the transaction block, a failure after the creation
-        # (but before the update of the skipped counter) will result in the skipped counters not getting propagated.
-        is_new_document = False
-        document = self._db[DOCUMENT].find_one({"datasourceId": self._datasource_id,
-                                                "additionalMetadata.vendorItemId": message["id"]})
-
-        # We need modified time for the document in datetime format for further processing. Since, the producer could
-        # only write string serialized data on the Kafka topic, we convert the modified time from string to datetime
-        # here in the consumer.
-        message["fileModDt"] = datetime.strptime(message["modifiedTime"], "%Y-%m-%dT%H:%M:%S.%f%z")
-
-        if document:
-            self._prev_document = copy.deepcopy(document)
-            self._prev_pii_records = list(self._db[PII_RECORD].find({"documentId": self._prev_document["_id"]}))
-            document_last_modified_time = document["lastModifiedTime"].replace(tzinfo=pytz.UTC)
-            trashed_status = document["trashed"]
-            # It might happen that we update the metadata for the file but there is a failure in the later stages of
-            # processing the document or the system crashes afterward. A document is marked as processed at the last
-            # stage when its tika response is processed. Hence, in the case when document metadata has not changed,
-            # before making a decision to skip further processing of the document, we also want to ensure that the
-            # document was fully processed earlier.
-            document_processed = document.get("processed")
-            if (document_last_modified_time == message["fileModDt"] and trashed_status == message["trashed"] and
-                    document_processed):
-                # No metadata needs to be updated. This is the case when the same document record got flushed more than
-                # once on the Kafka topic due to possible producer crashes.
-                skip_document = True
-            else:
-                # Update file metadata and also check whether the file should be reprocessed based on whether the file's
-                # content has changed.
-                document, skip_document = self._handle_existing_document_metadata(document, message)
-            self._current_document = copy.deepcopy(document)
-        else:
-            document = self._handle_new_document_metadata(message)
-            self._current_document = copy.deepcopy(document)
-            is_new_document = True
-
-        if message["skipped"]:
-            # This is the case when although the system does not support processing this file, the producer
-            # has flushed the file on the Kafka topic so that we can record the metrics for such skipped files.
-            if document.get("size"):
-                # GDrive vendor API does not send size information for non-binary files. At this point of file
-                # processing, we have not downloaded the file content and hence we do not know the size for such files.
-                self._processed_bytes.labels(status_code=None, topic_name=self._topic_name,
-                                             datasource_id=self._datasource_id, skipped=True,
-                                             skip_reason=message["skipReason"]).inc(document["size"])
-                push_to_gateway(PROMETHEUS_PUSH_GATEWAY_URL, job=self._datasource_type,
-                                registry=self._prometheus_registry)
-            skip_document = True
-
-        return Document(document=document, skip_document=skip_document, is_new_document=is_new_document)
-
-    def _handle_document_delete(self, vendor_item_id: str):
-        """Handles the delete event received on a file from the vendor API. This change event is sent when the file is
-        permanently deleted at the source."""
-        document = self._db[DOCUMENT].find_one({"datasourceId": self._datasource_id,
-                                                "additionalMetadata.vendorItemId": vendor_item_id})
-        if not document:
-            logger.info(f"Document with vendor item ID {vendor_item_id} not found or is already deleted")
-            return
-
-        self._prev_document = document
-        document_id = document["documentId"] = document.pop("_id")
-        document["datasourceType"] = self._datasource_type
-
-        # Create a clone of the document record in the archived_document collection before deleting the record from the
-        # document collection so that a background job can take care of handling its dependencies. With this approach
-        # of having a backup collection, we avoid possible race conditions that could happen in other background jobs
-        # like the entity resolution job if it is operating on the same document record.
-        with SINGLETON_MONGO_CLIENT.start_session() as mongo_client_session:
-            with mongo_client_session.start_transaction():
-                self._db[ARCHIVED_DOCUMENT].insert_one(document, session=mongo_client_session)
-                self._db[DOCUMENT].delete_one({"_id": document_id}, session=mongo_client_session)
-        logger.info(f"Removed document {document_id} from MongoDB collection for delete event")
-
-    def _should_rescan_document(self, document_id: str) -> Tuple[Optional[Dict[str, Any]], bool]:
-        document = self._db[DOCUMENT].find_one({"_id": ObjectId(document_id),
-                                                "$or": [{"annotation": None}, {"annotation": ""}],
-                                                "type": DOCUMENT_ANNOTATION_TYPE_FILTER})
-        if document:
-            return document, True
-        logger.info(f"Document {document_id} not found or is already classified")
-        return None, False
-
-    def _get_file_data(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        """Gets file content for the document in process and also returns the file size that can be updated for the
-        document record in case the vendor API did not provide it."""
-        file_data = {}
-        file_path = message["filePath"]
-        basename = file_data["basename"] = Path(file_path).name
-        shared_drive_user_email = message.get("sharedDriveUserEmail")
-        parent_folder_shared_with_user = bool(message.get("parentFolderSharedWithUser"))
-        with tempfile.TemporaryDirectory() as tmp_dir_name:
-            download_status, file_data["fileSize"] = self.download_file(
-                file_path, tmp_dir_name, message["driveId"], shared_drive_user_email,
-                message["trashed"], parent_folder_shared_with_user=parent_folder_shared_with_user)
-            if not download_status:
-                return {}
-            file_extension = Path(basename).suffix.replace(".", "")
-            if file_extension in LOG_FILE_EXTENSIONS:
-                with open(tmp_dir_name / Path(basename)) as fh:
-                    file_data["fileContent"] = fh.read(LOG_FILE_MAX_ALLOWED_CHARS)
-            else:
-                with open(tmp_dir_name / Path(basename), "rb") as fh:
-                    file_data["fileContent"] = fh.read()
-        return file_data
-
-    @retry((requests.exceptions.Timeout, requests.exceptions.ConnectionError), tries=ML_SERVICES_RETRY_ATTEMPTS,
-           delay=ML_SERVICES_RETRY_DELAY_SECONDS, backoff=2, jitter=(1, 10))
-    def _process_file_data(self, document: Dict[str, Any], file_data: Dict[str, Any], is_new_document: bool):
-        basename: str = file_data["basename"]
-        try:
-            if document["type"] in LOG_FILE_EXTENSIONS:
-                response = process_log_file_request(message=file_data["fileContent"],
-                                                    payload_extra_params={"object_name": basename})
-                status_code = response.status_code
-                response_json = response_json()
-            else:
-                status_code, response_json = send_file_to_tika(file_data["fileContent"], basename)
-                if status_code != 200:
-                    self.handle_tika_failure(basename)
-                    return
-                response_json = response.json()
-
-            if not response.ok:
-                self.handle_tika_failure(basename, request_error=None, response=response)
-                return
-        except Exception as e:
-            request_error = f"Request failed due to {str(e)}"
-            self.handle_tika_failure(basename, request_error=request_error, response=None)
-            return
-
-        self._processed_bytes.labels(status_code=status_code, topic_name=self._topic_name,
-                                     datasource_id=self._datasource_id, skipped=False,
-                                     skip_reason=None).inc(file_data["fileSize"])
-        try:
-            # Pushing to Prometheus gateway is best-effort so we suppress any failures that occur.
-            push_to_gateway(PROMETHEUS_PUSH_GATEWAY_URL, job=self._datasource_type,
-                            registry=self._prometheus_registry)
-        except Exception:
-            logger.exception("Unable to push fileSize metrics to Prometheus")
-
-        logger.debug(f"Response for {basename}: {response_json}")
-
-        with SINGLETON_MONGO_CLIENT.start_session() as mongo_session:
-            with mongo_session.start_transaction():
-                _, kafka_payload = self._tika_response_processor.process(
-                    document, response_json, is_new_document=is_new_document, old_document=self._prev_document)
-
-        self._stats_aggregator_producer.write_to_kafka(DATASOURCE_STATS_KAFKA_TOPIC_NAME, str(self._datasource_id),
-                                                       kafka_payload, synchronous=True)
-
-    def handle_tika_failure(self, basename: str, request_error: Optional[str] = "",
-                            response: Optional[requests.Response] = None):
-
-        if request_error:
-            msg = request_error
-            skip_reason = TikaRequestFailedSkipReason
-        else:
-            msg = f"Unable to process {basename} with error code {response.status_code}: {response.text}"
-            skip_reason = TikaProcessingFailedSkipReason
-
-        logger.error(msg)
-        if self._raise_request_failure_exception:
-            raise Exception(msg)
-
-        self._db[DOCUMENT].update_one({"_id": self._current_document["_id"]},
-                                      {"$set": {"skipped": True, "skipReason": skip_reason}})
-        self._current_document["skipped"] = True
-        self._current_document["skipReason"] = skip_reason
-        kafka_message_body = json.loads(json_util.dumps({
-            "datasourceType": self._datasource_type,
-            "document": self._current_document,
-            "piiRecords": self._current_pii_records,
-            "previousDocument": self._prev_document,
-            "previousPiiRecords": self._prev_pii_records
-        }))
-        self._stats_aggregator_producer.write_to_kafka(DATASOURCE_STATS_KAFKA_TOPIC_NAME,
-                                                       str(self._datasource_id),
-                                                       kafka_message_body, synchronous=True)
+        self._mail_size = Int64(0)
+        self._has_attachments = False
+        self._document_ids: List[ObjectId] = []
+        # Initialize change capture for identifier collection.
+        self._identifier_manager = IdentifierManager()
+        self._identifier_manager.initialize(SINGLETON_MONGO_CLIENT)
+        self._mail_info: Dict[str, Any] = {}
+        self._is_new_mail = False
 
     def handle_shutdown(self):
         """
@@ -594,119 +151,584 @@ class GoogleDriveConsumer:
                 yield messages[0]
 
     def consume_kafka_topic(self):
-        """Processes messages written to the datasource's Kafka topic by the historical and live sync producer jobs."""
-        self._create_rclone_instance()
-        requests_session = requests.Session()
-        retries = Retry(total=2,
-                        backoff_factor=0.1,
-                        status_forcelist=[500, 502, 503, 504])
-        requests_session.mount(self._file_processor_request_endpoint, HTTPAdapter(max_retries=retries))
-
-        for message in self._message_iterator():
-            logger.info(f"Consuming message with key {message.key}")
-            if SIGTERM_SHUTDOWN:
-                self.handle_shutdown()
-            message = message.value
-            is_new_document = False
-            self._current_document = None
-            self._prev_document = None
-            self._prev_pii_records = None
-            self._current_pii_records = None
-
-            # TODO: Check how we can optimise the rescan process by not sending the flag in each message.
-            if message.get("rescan"):
-                # This event is written by the rescan job for an existing document record.
-                document, rescan_document = self._should_rescan_document(message["documentId"])
-                if not rescan_document:
-                    self._consumer.commit()
-                    continue
-            elif message.get("removed"):
-                # This event is received when the document is deleted at source.
-                self._handle_document_delete(message["id"])
+        """
+        This method consumes all the messages provided by gmail producer.
+        """
+        try:
+            for message in self._message_iterator():
+                logger.info(f"Consuming message with key {message.key}")
+                if SIGTERM_SHUTDOWN:
+                    self.handle_shutdown()
+                message = message.value
+                self._document_ids = []
+                self._is_new_mail = False
+                self._has_attachments = False
+                # Resetting to 0 before processing each message, otherwise it will just keep on accumulating with each
+                # message.
+                self._mail_size = Int64(0)
+                # Clearing document to be marked risky list before processing each message to avoid marking documents
+                # risky from previous message.
+                self._documents_to_be_marked_risky.clear()
+                self.handle_msg(message)
+                # Commit offset of the message in Kafka topic for the consumer.
                 self._consumer.commit()
-                continue
-            else:
-                document, skip_document, is_new_document = self._should_skip_document(message)
-                if skip_document:
-                    if self._current_document:
-                        self._current_pii_records = list(self._db[PII_RECORD].find({
-                            "documentId": self._current_document["_id"]}))
-                    kafka_message_body = json.loads(json_util.dumps({
-                        "datasourceType": self._datasource_type,
-                        "document": self._current_document,
-                        "piiRecords": self._current_pii_records,
-                        "previousDocument": self._prev_document,
-                        "previousPiiRecords": self._prev_pii_records
-                    }))
-                    self.process_db_ops_transaction()
-                    self._stats_aggregator_producer.write_to_kafka(DATASOURCE_STATS_KAFKA_TOPIC_NAME,
-                                                                   str(self._datasource_id),
-                                                                   kafka_message_body, synchronous=True)
-                    self._consumer.commit()
-                    continue
 
-            file_data = self._get_file_data(message)
-            if not file_data.get("fileContent"):
-                self._current_document["skipped"] = True
-                self._current_document["skipReason"] = AttachmentDownloadFailedSkipReason
-                self._message_db_ops[DOCUMENT].append(UpdateOne(
-                    {"_id": self._current_document["_id"]},
-                    {"$set": {"skipped": True,
-                              "skipReason": AttachmentDownloadFailedSkipReason}}))
+        except Exception as exc:
+            logger.exception("Failed to process message")
+            raise exc
+
+    def handle_msg(self, kafka_message: Dict[str, Any]):
+        """
+        This method processes an email message.
+         1. Checks for any pii data in an email message.
+         2. Checks for any attachments in an email and send them to tika for PII detection.
+        :param kafka_message: Message dict from kafka broker.
+        """
+        user_info = kafka_message["userInfo"]
+        msg = kafka_message["message"]
+        msg_id = msg["id"]
+        logger.debug(f"Message info: {msg}, user_info: {user_info}")
+        service = service_account_login_gmail(self._config, user_info["email"])
+
+        try:
+            msg_details = service.users().messages().get(userId="me", id=msg_id).execute()
+            logger.debug(f"Message details: {msg_details}")
+        except HttpError as ex:
+            if ex.resp.status == NOT_FOUND:
+                logger.info(f"Skipping message: {msg_id} unable to fetch details.")
+                return
+            raise ex
+
+        label_ids = msg_details.get("labelIds")
+        msg_id = msg_details["id"]
+        email = user_info["email"]
+        mail_time = datetime.fromtimestamp(int(msg_details["internalDate"]) / 1000, timezone.utc)
+
+        if not label_ids or "DRAFT" in label_ids:
+            # Note: In case of draft, some headers are not present. So we need to consider that while
+            # implementing consumer for drafts.
+            # TODO (Keshav.G) : Add support for drafts.
+            logger.info(f"Skipping message {msg_id} with label {label_ids} for user {email}")
+            return
+
+        header_info = {}
+        header_keys = ["To", "From", "Subject", "Date", "Message-Id", "Bcc", "Cc"]
+        for header in msg_details["payload"]["headers"]:
+            if header["name"] in header_keys:
+                header_info[header["name"]] = header["value"]
+        logger.debug(f"Header info: {header_info}")
+
+        additional_metadata = {
+            "threadId": msg_details["threadId"],
+            "messageId": msg_id,
+            "mailboxId": email,
+            "postTime": mail_time
+        }
+        if header_info.get("Message-Id"):
+            additional_metadata["globalMessageId"] = header_info["Message-Id"]
+
+        sender_info = get_name_and_email(header_info["From"])
+        org_domain = extract_domain_from_email(sender_info["email"])
+        # Merging receiver info from 'To', 'Bcc' and 'Cc'.
+        recipient_info = self.get_recipients(
+            header_info.get("To", "") + header_info.get("Cc", "") + header_info.get("Bcc", ""), org_domain)
+        recipients = recipient_info.recipients
+
+        if not recipients:
+            logger.error(f"Skipping not able to extract recipient info for msg {msg_details}")
+            return
+
+        additional_metadata["sharedExternally"] = recipient_info.shared_externally
+        additional_metadata["sharedInternally"] = recipient_info.shared_internally
+
+        self._mail_info = {
+            "threadId": msg_details["threadId"],
+            "messageId": msg_details["id"],
+            "datasourceId": self._datasource_id,
+            "sender": sender_info,
+            "recipients": recipients,
+            "subject": header_info.get("Subject", ""),
+            "timestamp": mail_time
+        }
+        logger.debug(f"Mail info: {self._mail_info}")
+
+        parts = msg_details["payload"].get("parts", [])
+        self._has_attachments = contains_attachment(parts)
+        if self._has_attachments:
+            mail_result = SINGLETON_MONGO_CLIENT[MAIL].update_one(
+                {"messageId": msg_details["id"], "datasourceId": self._datasource_id},
+                {"$set": self._mail_info}, upsert=True)
+            if mail_result.upserted_id:
+                self._is_new_mail = True
+
+        has_calendar_attachment = contains_calendar_attachment(parts)
+        if has_calendar_attachment:
+            logger.info(f"{msg_id} has a calendar attachment")
+        pii_records = self.process_msg_parts(msg_id, [msg_details["payload"]], additional_metadata,
+                                             sender_info, service, not has_calendar_attachment)
+        pii_attributes = self.get_pii_attributes_from_pii_records(pii_records)
+
+        SINGLETON_MONGO_CLIENT[MAIL].update_one({"messageId": msg["id"], "datasourceId": self._datasource_id},
+                                                {"$set": {"size": int(self._mail_size),
+                                                          "documentIds": self._document_ids,
+                                                          "hasAttachments": self._has_attachments}})
+
+        # Email with no PII attribute and no attachments is not needed to be recorded.
+        if not pii_attributes and not self._has_attachments:
+            # TODO: Need to figure out if the same email is sent mail is sent again count should not be updated here.
+            # Updating mail count in group summary if present in recipient list.
+            update_mail_count_group_summary(recipients, self._datasource_id)
+            update_mail_count_user_summary(email, self._datasource_id)
+            update_mail_size_user_summary(email, self._datasource_id, self._mail_size)
+            update_mail_count_external_members(recipients, self._datasource_id)
+            # Since pii attribute list is empty, there is no point in checking for risk and no need for creating
+            # a new mail record.
+            return
+
+        foreign_recipients = check_for_mail_risk(recipients, header_info["From"], self._datasource_id)
+        foreign_recipient_domains = set([get_domain(foreign_recipient) for foreign_recipient in foreign_recipients])
+
+        # Check for risks.
+        if foreign_recipient_domains:
+            pii_record_ids = [pii_record["_id"] for pii_record in pii_records]
+            self.create_violation_record(sender_info, foreign_recipient_domains, pii_record_ids, pii_attributes,
+                                         mail_time)
+            risk = "high"
+            if self._documents_to_be_marked_risky:
+                # Mark all the documents risky for the current mail that contained PII data.
+                SINGLETON_MONGO_CLIENT[DOCUMENT].bulk_write(self._documents_to_be_marked_risky)
+        else:
+            risk = "low"
+        logger.debug(f"pii attributes : {pii_attributes}")
+
+        # Update MongoDB for the email collection.
+        update_mail_info = {
+            "risk": risk,
+            "foreignRecipientCount": len(foreign_recipients),
+            "piiAttributesCount": len(pii_attributes)
+        }
+        logger.debug(f"Update Mail info: {update_mail_info}")
+        mail_result = SINGLETON_MONGO_CLIENT[MAIL].update_one(
+            {"messageId": msg_details["id"], "datasourceId": self._datasource_id},
+            {"$set": update_mail_info}, upsert=True)
+        if self._is_new_mail:
+            # Check if new record is inserted then only update mail count.
+            if not pii_attributes:
+                update_mail_count_user_summary(email, self._datasource_id)
+                update_mail_count_external_members(recipients, self._datasource_id)
+            else:
+                update_mail_count_user_summary(email, self._datasource_id, is_sensitive=True,
+                                               is_risky=bool(foreign_recipient_domains))
+                update_mail_count_external_members(recipients, self._datasource_id, is_sensitive=True)
+            update_mail_count_group_summary(recipients, self._datasource_id)
+            update_mail_size_user_summary(email, self._datasource_id, self._mail_size)
+
+    def create_violation_record(self, sender_info: Dict[str, Any], foreign_recipient_domains: Set[str],
+                                pii_record_ids: List[str], pii_attributes: Set[str],
+                                post_time: datetime):
+        """
+        Helper method to create a violation record.
+        :param sender_info: Senders info.
+        :param foreign_recipient_domains: Set of domains of people out side org.
+        :param pii_record_ids: List of pii_record ids.
+        :param pii_attributes: List of Pii attributes.
+        :param post_time: Time at which email was posted.
+        :return Dict: A violation record.
+        """
+        sender_id = sender_info["email"]
+        if sender_info.get("name"):
+            sender_name = sender_info["name"]
+        else:
+            sender_name = sender_info["email"]
+        receivers = [{"name": domain} for domain in foreign_recipient_domains]
+
+        record = {
+            "datasourceId": self._datasource_id,
+            "senderId": sender_id,
+            "senderName": sender_name,
+            "receivers": receivers,
+            "piiRecordIds": pii_record_ids,
+            "piiAttributes": list(pii_attributes),
+            "dateTime": post_time
+        }
+        logger.debug(f"Violation record: {record}")
+
+        violation = SINGLETON_MONGO_CLIENT[VIOLATION].insert_one(record)
+
+        violation_id = violation.inserted_id
+        logger.debug(f"Inserted violation entry with id: {violation_id}")
+
+    @staticmethod
+    def get_recipients(recipients_str: str, sender_domain: str) -> RecipientInfo:
+        """
+        This method creates a RecipientInfo namedtuple from a string containing all recipients.
+        :param recipients_str: String containing recipient information.
+        :param sender_domain: Domain of the sender.
+        :return: NamedTuple RecipientInfo having recipients and boolean indicating if it contains external/internal
+        recipients.
+        """
+        recipients = []
+        shared_externally = False
+        shared_internally = False
+        recipients_str = next(csv.reader([recipients_str], delimiter=",", quotechar='"'))
+        for recipient_str in recipients_str:
+            recipient_dict = get_name_and_email(recipient_str)
+            if "email" not in recipient_dict:
+                logger.error(f"Unable to extract email from {recipient_str} in {recipients_str}")
+                continue
+            if extract_domain_from_email(recipient_dict["email"]) == sender_domain:
+                recipient_dict["isInternal"] = True
+                shared_internally = True
+            else:
+                recipient_dict["isInternal"] = False
+                shared_externally = True
+            recipients.append(recipient_dict)
+        return RecipientInfo(recipients, shared_internally, shared_externally)
+
+    def process_msg_parts(self, msg_id: str, msg_parts: List[Dict[str, Any]],
+                          additional_metadata: Dict[str, Any], sender_info: Dict[str, Any], service: Any,
+                          consider_text: True) -> List[Any]:
+        """
+        This method recursively process all the message parts for a message.
+        :param msg_id: ID of the message.
+        :param msg_parts: List of message parts.
+        :param additional_metadata: Additional metadata needed for creating document.
+        :param sender_info: Info of sender.
+        :param service: Google mail api service instance.
+        :param consider_text: Whether text has to be processed (can be False if we have determined that there is a
+        calendar attachment).
+        :return: List of pii records.
+        """
+        pii_records = []
+        for msg_part in msg_parts:
+            if msg_part.get("parts"):
+                part_pii_records = self.process_msg_parts(msg_id, msg_part["parts"], additional_metadata, sender_info,
+                                                          service, consider_text)
+                pii_records.extend(part_pii_records)
+
+            if msg_part.get("filename"):
+                # This part of the message is attachment.
+                file_name = msg_part["filename"]
+                if msg_part["body"]["size"] > 0:
+                    size = msg_part["body"]["size"]
+                    if size > FILE_MAX_SIZE_BYTES_VAL:
+                        logger.info(f"Skipping file {file_name} as size exceeds the max file size limit: {size}")
+                        msg_part["skipped"] = True
+                        msg_part["skipReason"] = "Size"
+                    attachment_pii_records = self.handle_attachments(msg_part, additional_metadata, sender_info,
+                                                                     service)
+                    pii_records.extend(attachment_pii_records)
+
+            elif msg_part["mimeType"] == "text/plain":
+                # This part of the message is text.
+                if msg_part["body"]["size"] > 0:
+                    if not consider_text:
+                        logger.info(f"Skipping text for message {msg_id}")
+                    else:
+                        text_pii_records = self.handle_text(msg_part, additional_metadata, sender_info)
+                        pii_records.extend(text_pii_records)
+
+        # We push metrics just once after processing all parts of a message instead of once for each part.
+        push_to_gateway(PROMETHEUS_PUSH_GATEWAY_URL, job=self._datasource_type, registry=self._prometheus_registry)
+        logger.debug(f"pii records found : {pii_records}")
+        return pii_records
+
+    def handle_attachments(self, msg_part: Dict[str, Any], additional_metadata: Dict[str, Any],
+                           sender_info: Dict[str, Any],
+                           service: Any) -> List[Any]:
+        """
+        This method fetches an attachment and does PII detection.
+        :param msg_part: Message part which contains attachment.
+        :param additional_metadata: Additional metadata need for document creation.
+        :param sender_info: Info of sender.
+        :param service: Google Api service instance.
+        :return: List of PII records.
+        """
+        global_attachment_id = ""
+        for header in msg_part.get("headers", []):
+            if header["name"] == "X-Attachment-Id":
+                global_attachment_id = header["value"]
+
+        if not global_attachment_id:
+            # If global attachment id is missing, then skip the image because, it a attachment that is not attached
+            # added by user. Usually these image are some icons.
+            file_name = msg_part["filename"]
+            logger.warning(f"Global attachment id missing for file : {file_name}")
+            return []
+
+        basename, filename_ext = os.path.splitext(msg_part["filename"])
+        filename_ext = filename_ext[1:].lower()
+
+        # Translating the file type to undefined formats.
+        # example : jpeg -> jpg
+        filename_ext = TRANSLATE_FILE_TYPE.get(filename_ext, filename_ext)
+        if filename_ext not in VALID_TYPES:
+            logger.info(f"Skipping unsupported {filename_ext} for : {basename}")
+            filename_ext = "other"
+            msg_part["skipped"] = True
+            msg_part["skipReason"] = "Type"
+
+        attachment_id = msg_part["body"]["attachmentId"]
+        additional_metadata["fileName"] = msg_part["filename"]
+        additional_metadata["attachmentId"] = attachment_id
+        document_name = f"{basename}_{global_attachment_id}"
+        size = msg_part["body"]["size"]
+        file_content = None
+        updated_data = {
+            "name": document_name,
+            "type": filename_ext,
+            "objectType": OBJ_TYPE_DOCUMENT,
+            "sharedBy": sender_info,
+            "datasourceId": self._datasource_id,
+            "size": size,
+            "additionalMetadata": additional_metadata,
+            # Note: Currently setting lastModifiedTime as post time. But there is no concept of modify timestamp
+            #       in Gmail.
+            "lastModifiedTime": additional_metadata["postTime"],
+            "skipped": msg_part.get("skipped", False),
+        }
+        if updated_data["skipped"]:
+            updated_data["skipReason"] = msg_part["skipReason"]
+        else:
+            # Fetch attachment.
+            attachment_info = service.users().messages().attachments().get(userId="me",
+                                                                           messageId=additional_metadata["messageId"],
+                                                                           id=attachment_id).execute()
+            file_content = base64.urlsafe_b64decode(attachment_info["data"].encode("UTF-8"))
+            hashes = hashlib.sha1()
+            hashes.update(file_content)
+            checksum = hashes.hexdigest()
+            updated_data.update({
+                "checksum": checksum,
+                "checksumType": "SHA-1"
+            })
+
+        document = {
+            "$set": updated_data,
+            "$inc": {"version": 1}
+        }
+        logger.debug(f"Document info : {document}")
+        # Create document with a unique attachment id in order to avoid redundant document creation.
+        document = SINGLETON_MONGO_CLIENT[DOCUMENT].update_one(
+            {"datasourceId": self._datasource_id, "additionalMetadata.attachmentId": attachment_id},
+            document, upsert=True)
+        if document.upserted_id:
+            self._document_ids.append(document.upserted_id)
+            self._mail_size += size
+
+        if updated_data["skipped"]:
+            self._processed_bytes.labels(status_code=None, topic_name=self._kafka_topic_name,
+                                         datasource_id=self._datasource_id, skipped=True,
+                                         skip_reason=updated_data["skipReason"]).inc(size)
+            current_document = SINGLETON_MONGO_CLIENT[DOCUMENT].find_one({
+                "datasourceId": self._datasource_id,
+                "additionalMetadata.attachmentId": attachment_id})
+            kafka_message_body = json.loads(json_util.dumps({
+                "datasourceType": self._datasource_type,
+                "document": current_document
+            }))
+            self._stats_aggregator_producer.write_to_kafka(DATASOURCE_STATS_KAFKA_TOPIC_NAME,
+                                                           str(self._datasource_id),
+                                                           kafka_message_body, synchronous=True)
+            return []
+
+        # Process the document.
+        # TODO (Keshav.G): Handle session timeout gracefully and add exponential try.
+        request_error = ""
+        try:
+            response = self._session.post(self._tika_url, data=file_content,
+                                          headers={"Content-type": "application/octet-stream",
+                                                   "X-File-Name": basename}, timeout=self._tika_timeout)
+        except Exception as e:
+            request_error = f"Request failed due to {str(e)}"
+
+        if request_error or response.status_code != 200:
+            if request_error:
+                msg = request_error
+                skip_reason = TikaRequestFailedSkipReason
+            else:
+                msg = f"Unable to process {basename} with error code {response.status_code}: {response.text}"
+                skip_reason = TikaProcessingFailedSkipReason
+            logger.error(msg)
+            if self._raise_request_failure_exception:
+                raise Exception(msg)
+            document = SINGLETON_MONGO_CLIENT[DOCUMENT].update_one({"datasourceId": self._datasource_id,
+                                                                    "additionalMetadata.attachmentId": attachment_id},
+                                                                   {"$set": {"skipped": True,
+                                                                             "skipReason": skip_reason}})
+            if document.upserted_id:
+                self._mail_size += size
+            self._processed_bytes.labels(status_code=response.status_code, topic_name=self._kafka_topic_name,
+                                         datasource_id=self._datasource_id, skipped=True,
+                                         skip_reason=skip_reason).inc(size)
+            current_document = SINGLETON_MONGO_CLIENT[DOCUMENT].find_one({
+                "datasourceId": self._datasource_id,
+                "additionalMetadata.attachmentId": attachment_id})
+            kafka_message_body = json.loads(json_util.dumps({
+                "datasourceType": self._datasource_type,
+                "document": current_document
+            }))
+            self._stats_aggregator_producer.write_to_kafka(DATASOURCE_STATS_KAFKA_TOPIC_NAME,
+                                                           str(self._datasource_id),
+                                                           kafka_message_body, synchronous=True)
+            return []
+
+        response_json: Dict[str, Any] = response.json()
+        logger.debug(f"Response for {basename}: {response_json}\n"
+                     f"Time taken to process {basename}: {int(response.elapsed.total_seconds() * 1000)} ms")
+        self._processed_bytes.labels(status_code=response.status_code, topic_name=self._kafka_topic_name,
+                                     datasource_id=self._datasource_id, skipped=False,
+                                     skip_reason=None).inc(size)
+
+        document = SINGLETON_MONGO_CLIENT[DOCUMENT].find_one({"name": document_name,
+                                                              "datasourceId": self._datasource_id})
+        pii_records, aggregator_kafka_payload = self._tika_response_processor.process(document, response_json)
+        self._stats_aggregator_producer.write_to_kafka(DATASOURCE_STATS_KAFKA_TOPIC_NAME,
+                                                       str(self._datasource_id), aggregator_kafka_payload,
+                                                       synchronous=True)
+        if pii_records:
+            self._documents_to_be_marked_risky.append(UpdateOne({"_id": document["_id"]}, {"$set": {"atRisk": True}}))
+
+        return pii_records
+
+    def handle_text(self, msg_part: Dict[str, Any], additional_metadata: Dict[str, Any],
+                    sender_info: Dict[str, Any]) -> List[Any]:
+        """
+        This method handles pii data detection in a text message.
+        :param msg_part: Part of message which contains the text.
+        :param additional_metadata: Additional metadata needed for creating document.
+        :param sender_info: Info of sender.
+        :return: List of pii records.
+        """
+        # TODO (Keshav.G): Currently assuming English text. Check what is the behaviour in-case of different languages.
+        data = msg_part["body"]["data"]
+        size = msg_part["body"]["size"]
+        email_text = base64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8")
+        email = additional_metadata["mailboxId"]
+        message_id = additional_metadata["messageId"]
+        part_id = msg_part["partId"]
+        name = f"{email}_{message_id}_{part_id}"
+
+        document = {
+            "$set": {
+                "name": name,
+                "type": "message",
+                "objectType": OBJ_TYPE_MESSAGE,
+                "sharedBy": sender_info,
+                "datasourceId": self._datasource_id,
+                "size": size,
+                "additionalMetadata": additional_metadata,
+                # Note: Currently setting lastModifiedTime as post time. But there is no concept of modify timestamp
+                #       in Gmail.
+                "lastModifiedTime": additional_metadata["postTime"]
+            },
+            "$inc": {"version": 1}
+        }
+        try:
+            status_code, response_json = send_message_to_presidio(message=email_text, sender_info=sender_info)
+        except Exception as e:
+            status_code = 500  # For exception setting status_code to 500.
+            request_error = f"Request failed due to {str(e)}"
+        if status_code != 200 or request_error:
+            if request_error:
+                msg = request_error
+                skip_reason = PresidioRequestFailedSkipReason
+            else:
+                msg = (f"Presidio server request for message: {email_text} failed with "
+                       f"status_code: {status_code}, response_body: {response_json}")
+                skip_reason = PresidioProcessingFailedSkipReason
+            logger.error(msg)
+            if self._raise_presidio_request_failure_exception:
+                raise Exception(msg)
+            document["$set"].update({"skipped": True, "skipReason": skip_reason})
+            if self._has_attachments:
+                document_res = SINGLETON_MONGO_CLIENT[DOCUMENT].update_one(
+                    {"datasourceId": self._datasource_id, "additionalMetadata.mailboxId": email,
+                     "additionalMetadata.messageId": message_id, "additionalMetadata.partId": part_id},
+                    document, upsert=True)
+                if document_res.upserted_id:
+                    self._document_ids.append(document_res.upserted_id)
+                    self._mail_size += size
+                self._processed_bytes.labels(status_code=status_code, topic_name=self._kafka_topic_name,
+                                             datasource_id=self._datasource_id, skipped=True,
+                                             skip_reason=document["skip_reason"]).inc(size)
+                current_document = SINGLETON_MONGO_CLIENT[DOCUMENT].find_one({
+                    "datasourceId": self._datasource_id, "name": name})
                 kafka_message_body = json.loads(json_util.dumps({
                     "datasourceType": self._datasource_type,
-                    "document": self._current_document,
-                    "piiRecords": self._current_pii_records,
-                    "previousDocument": self._prev_document,
-                    "previousPiiRecords": self._prev_pii_records
+                    "document": current_document
                 }))
-                self.process_db_ops_transaction()
                 self._stats_aggregator_producer.write_to_kafka(DATASOURCE_STATS_KAFKA_TOPIC_NAME,
                                                                str(self._datasource_id),
                                                                kafka_message_body, synchronous=True)
-                self._consumer.commit()
-                continue
+            return []
 
-            # GSuite API does not return file size for non-binary files. In such cases, we could not record the file
-            # size in the document record and also did not increment the cumulative size for the drive record
-            # associated with the document record.
-            # Since, we now have downloaded the file using rclone and know its size, we update those.
-            file_size = self._current_document["size"] = file_data["fileSize"]
+        logger.debug(f"Presidio response: {response_json}")
 
-            if self._prev_document:
-                file_size -= self._prev_document["size"]
+        # If the email body does not contains any PII records and if there are no attachments, we don't want to
+        # record such emails.
+        if not should_create_document(self._identifier_manager.identifier_details_dict,
+                                      response_json) and not self._has_attachments:
+            return []
 
-            if file_size != 0:
-                self._message_db_ops[DOCUMENT].append(UpdateOne({"_id": self._current_document["_id"]},
-                                                                {"$set": {"size": self._current_document["size"]}}))
+        mail_result = SINGLETON_MONGO_CLIENT[MAIL].update_one(
+            {"messageId": self._mail_info["messageId"], "datasourceId": self._datasource_id},
+            {"$set": self._mail_info}, upsert=True)
+        if mail_result.upserted_id:
+            self._is_new_mail = True
 
-            logger.debug(f"Firing MongoDB operations on {len(self._messag e_db_ops.keys())} collections")
-            self.process_db_ops_transaction()
+        # Create document with a unique mailboxId/messageId/threadId in order to avoid redundant document creation.
+        document = SINGLETON_MONGO_CLIENT[DOCUMENT].update_one(
+            {"datasourceId": self._datasource_id, "additionalMetadata.mailboxId": email,
+             "additionalMetadata.messageId": message_id, "additionalMetadata.partId": part_id},
+            document, upsert=True)
+        if document.upserted_id:
+            self._document_ids.append(document.upserted_id)
+            self._mail_size += size
+        document = SINGLETON_MONGO_CLIENT[DOCUMENT].find_one({"name": name, "datasourceId": self._datasource_id})
+        pii_records, aggregator_kafka_payload = self._tika_response_processor.process(document, response_json)
+        self._stats_aggregator_producer.write_to_kafka(DATASOURCE_STATS_KAFKA_TOPIC_NAME,
+                                                       str(self._datasource_id), aggregator_kafka_payload,
+                                                       synchronous=True)
 
-            self._process_file_data(self._current_document, file_data, is_new_document, requests_session)
+        if pii_records:
+            self._documents_to_be_marked_risky.append(
+                UpdateOne({"_id": document["_id"]}, {"$set": {"atRisk": True}}))
 
-            # Commit offset of the message in Kafka topic for the consumer.
-            self._consumer.commit()
+        # TODO (Kasim Sharif): Need to check if we want to record processed bytes only when new document entry
+        #  is created.
+        self._processed_bytes.labels(status_code=status_code, topic_name=self._kafka_topic_name,
+                                     datasource_id=self._datasource_id, skipped=False,
+                                     skip_reason=None).inc(size)
+        return pii_records
 
-    def process_db_ops_transaction(self):
+    def get_pii_attributes_from_pii_records(self, pii_records: List[Dict[str, Any]]) -> Set[str]:
         """
-        Processes all DB operations in the message_db_ops dictionary as a transaction.
-
-        The list of DB operations is cleared after the transaction is committed.
+        This method fetches all of the pii_attributes from all PII records.
+        :param pii_records: Pii record dictionary.
+        :return: Set of all identifiers in the pii record.
         """
-        if not self._message_db_ops:
-            return
-        with SINGLETON_MONGO_CLIENT.start_session() as mongo_session:
-            with mongo_session.start_transaction():
-                for collection, operations in self._message_db_ops.items():
-                    self._db[collection].bulk_write(operations, session=mongo_session)
-        self._message_db_ops.clear()
+        pii_attributes = set()
+        for pii_record in pii_records:
+            pii_attributes.update(set(pii_record["piiData"]).union(pii_record.get("dynamicPiiData", {})))
+        return pii_attributes
 
 
 def main():
     signal.signal(signal.SIGTERM, sigterm_handler)
-    datasource_id = ObjectId(os.getenv("DATASOURCE_ID"))
-    consumer = GoogleDriveConsumer(datasource_id)
+    datasource = SINGLETON_MONGO_CLIENT[DATASOURCE].find_one({"_id": DATASOURCE_ID})
+    datasource_config = get_configuration()
+    # TODO (keshav.G): remove this process_rclone_env_variables instead create new method that use datasource_config.
+    service_account_file = process_rclone_env_variables(DATASOURCE_ID)
+
+    config = Config(datasource_id=DATASOURCE_ID,
+                    service_account_file=service_account_file,
+                    delegated_credential=os.getenv(DELEGATED_CREDENTIAL_ENV, {}),
+                    domain=os.getenv(DOMAIN_ENV),
+                    kafka_bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS_VAL,
+                    account_type=datasource_config["accountType"])
+
+    consumer = GoogleEmailConsumer(datasource, config)
     consumer.consume_kafka_topic()
 
 
